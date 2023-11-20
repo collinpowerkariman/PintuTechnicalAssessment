@@ -1,0 +1,3 @@
+order_id,symbol,order_side,size,price,status,created_at
+0,BTC-USDT,SELL,0.75,34010.0,OPEN,1693973108
+0,,,,,CLOSED,1693979408
