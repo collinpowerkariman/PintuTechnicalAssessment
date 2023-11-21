@@ -1,26 +1,28 @@
 # Order Book Aggregator
 
-This app uses flink window function to aggregate incoming order by its `side` and `price`, each time the one-second
-tumbling
-window closes it will output the aggregated result to kafka with topic `order_books` and keep the open order booking for
-the next window.
+Generate booking information from order stream every 1-second interval.
+
+## Design parameters
+
+1. the pipeline should output at 1-second interval.
+2. each order is group into booking by its `side` and `price`.
+3. each time the order is closed it should be deducted from the booking.
+4. every output should contain the cumulative sum of each `side`. 
+5. the output should be a list booking that is published on another kafka topic (in this case `order_bookings`).
 
 ## How To Run
 
-There is a multiple way to run these apps but in all cases you will need to start the included docker compose.
+To run this app you will need to install the dependency on `requirement.txt` and start the included docker compose.
 
 ### Using System Python
-
-install the necessary dependency using:
-
-```shell
-pip install -r requirement.txt
-```
-
-Note: it is recommended to use a virtual environment such as `venv` to isolate the project.
-
 run the app using:
 
 ```shell
 python order_book_aggregator.py
 ```
+
+## Limitations
+
+1. this app does not have checkpointing, so each time its restarted it will start from the earliest data.
+2. this app still uses host memory to store state.
+3. this app uses `created_at` of the event as the event-time.
