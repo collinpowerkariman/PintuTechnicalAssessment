@@ -12,83 +12,92 @@ from pyflink.datastream.connectors.kafka import KafkaSource, KafkaOffsetsInitial
     KafkaRecordSerializationSchema, KafkaSink
 from pyflink.datastream.formats.json import JsonRowDeserializationSchema
 from pyflink.datastream.functions import ProcessAllWindowFunction
-from pyflink.datastream.state import MapStateDescriptor, ListStateDescriptor
+from pyflink.datastream.state import MapStateDescriptor, MapState
 from pyflink.datastream.window import TumblingEventTimeWindows
 
 
 class CreatedAtTimestampAssigner(TimestampAssigner):
 
     def extract_timestamp(self, value: Row, record_timestamp: int) -> int:
-        # return record_timestamp
+        return record_timestamp
 
         # use field created_at as timestamp if producer can maintain monotonously increasing timestamp
-        return value['created_at']
+        # return value['created_at']
 
 
 class OrderBookingProcess(ProcessAllWindowFunction):
-    orders_state_desc = MapStateDescriptor("orders", Types.LONG(), Types.TUPLE([Types.STRING(), Types.DOUBLE()]))
-    closed_ids_state_desc = ListStateDescriptor("closed_ids", Types.LONG())
-    bookings_state_desc = MapStateDescriptor("bookings", Types.STRING(), Types.PICKLED_BYTE_ARRAY())
 
     def process(self, context: 'ProcessAllWindowFunction.Context', elements: Iterable[Row]) -> Iterable[str]:
-        orders = context.global_state().get_map_state(self.orders_state_desc)
-        closed_ids = context.global_state().get_list_state(self.closed_ids_state_desc)
-        bookings = context.global_state().get_map_state(self.bookings_state_desc)
-
-        for order_id in closed_ids:
-            booking_key = orders[order_id][0]
-            bookings[booking_key]['amount'] -= orders[order_id][1]
-            del orders[order_id]
-
-            if bookings[booking_key]['amount'] <= 0:
-                del bookings[booking_key]
-
-        closed_ids.clear()
+        open_order_books_state_desc = MapStateDescriptor("open_order_books", Types.STRING(), Types.PICKLED_BYTE_ARRAY())
+        open_order_books = context.global_state().get_map_state(open_order_books_state_desc)
+        closed_order_books = []
 
         for order in elements:
-            order_id = order['order_id']
-            if str(order['status']).lower() == 'closed':
-                closed_ids.add(order_id)
+            if order['status'] == 'CLOSED':
+                self.__move_values(open_order_books, closed_order_books)
                 continue
 
-            booking_key = f"{order['order_side']}@{order['price']}".lower()
-            orders[order_id] = (booking_key, order['size'])
-            if booking_key in bookings:
-                bookings[booking_key]['amount'] += order['size']
+            key, order_book = self.__to_order_book(order)
+            if key in open_order_books:
+                open_order_books[key] = self.__merge_order_book(open_order_books[key], order_book)
                 continue
 
-            bookings[booking_key] = {
-                'symbol': order['symbol'],
-                'side': order['order_side'],
-                'price': order['price'],
-                'amount': order['size'],
-            }
+            open_order_books[key] = order_book
+
+        return [self.__prepare_result(open_order_books, closed_order_books)]
+
+    @staticmethod
+    def __merge_order_book(order_a, order_b):
+        order_a['amount'] += order_b['amount']
+        order_a['total'] = order_a['price'] * order_a['amount']
+        order_a['cum_sum'] = order_a['total']
+        return order_a
+
+    @staticmethod
+    def __to_order_book(order):
+        order_book = {
+            'symbol': order['symbol'],
+            'side': order['order_side'],
+            'price': order['price'],
+            'amount': order['size'],
+            'total': order['price'] * order['size'],
+            'cum_sum': order['price'] * order['size'],
+        }
+        key = f'{order_book["price"]}@{order_book["side"]}'
+        return key, order_book
+
+    @staticmethod
+    def __prepare_result(open_order_books: MapState, closed_order_books: list) -> str:
+        all_books = closed_order_books
+        for book in open_order_books.values():
+            all_books.append(book)
 
         buy_idx = 1
-        buy_sum = 0
         sell_idx = 1
-        sell_sum = 0
+        prev_buy_cum_sum = 0
+        prev_sell_cum_sum = 0
 
         native = []
-        booking_keys = list(bookings.keys())
-        for booking_key in booking_keys:
-            booking = bookings[booking_key]
-            if str(booking_key).startswith('buy'):
-                booking['side'] = f'BUY_{buy_idx}'
-                buy_idx += 1
-                booking['total'] = booking['price'] * booking['amount']
-                booking['cum_sum'] = booking['total'] + buy_sum
-                buy_sum += booking['total']
-            else:
-                booking['side'] = f'SELL_{sell_idx}'
+        for book in all_books:
+            if str(book['side']).startswith("SELL"):
+                book['side'] = f'SELL_{sell_idx}'
                 sell_idx += 1
-                booking['total'] = booking['price'] * booking['amount']
-                booking['cum_sum'] = booking['total'] + sell_sum
-                sell_sum += booking['total']
+                book['cum_sum'] += prev_sell_cum_sum
+                prev_sell_cum_sum = book['cum_sum']
+            else:
+                book['side'] = f'BUY_{buy_idx}'
+                buy_idx += 1
+                book['cum_sum'] += prev_buy_cum_sum
+                prev_buy_cum_sum = book['cum_sum']
+            native.append(book)
 
-            native.append(booking)
+        return json.dumps(native)
 
-        return [json.dumps(native)]
+    @staticmethod
+    def __move_values(open_order_books, closed_order_books):
+        for k in list(open_order_books.keys()):
+            closed_order_books.append(open_order_books[k])
+            del open_order_books[k]
 
 
 def main():
@@ -132,7 +141,6 @@ def main():
         .build()
 
     stream.sink_to(sink)
-
     env.execute()
 
 
